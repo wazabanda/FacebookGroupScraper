@@ -126,6 +126,8 @@ Don't run `docker compose config` without `--no-interpolate`: it prints `.env` v
 {
   "author": "Kali Siege",
   "text": "What tools does ZORIN has...",
+  "posted_at": "2026-10-14T23:50:00+02:00",
+  "posted_at_text": "Wednesday, October 14, 2026 at 11:50 PM",
   "url": "https://www.facebook.com/groups/1421088291504611/posts/5095958447350892/",
   "reactions_total": "4",
   "reaction_types": {"Like": "3", "Love": "1"},
@@ -142,7 +144,8 @@ Don't run `docker compose config` without `--no-interpolate`: it prints `.env` v
 - `reaction_types` covers only the top 3 reaction types, which is all Facebook shows under a post.
 - Counts are strings as Facebook displays them (e.g. `"1.2K"`).
 - `poll` is empty for posts without a poll. `share` is the percentage Facebook shows; `you_voted` is whether the logged-in account picked that option. `votes` and `voters` come from opening each option's voter list, which needs a login; `profile` is `null` for anonymous voters.
-- `url` is often `null` when logged in, because Facebook only fills in post links when the mouse hovers over them.
+- `posted_at` comes from the tooltip shown when hovering over the post's time (the visible time text is scrambled by Facebook). It's in the browser's timezone: your computer's, or UTC in Docker unless you set `TZ` (e.g. `TZ: Africa/Lusaka` under `environment` in `compose.yaml`). `posted_at_text` keeps the original string. Both are `null` if the hover fails.
+- The same hover fills in `url`.
 
 ## Limitations
 

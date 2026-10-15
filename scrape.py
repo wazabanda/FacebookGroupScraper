@@ -8,10 +8,12 @@ import json
 import os
 import random
 import time
+from datetime import datetime
 from pathlib import Path
 
 from selenium import webdriver
 from selenium.common.exceptions import ElementClickInterceptedException, StaleElementReferenceException
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
@@ -55,9 +57,17 @@ const poll = [...post.querySelectorAll('[aria-label$="of the votes"]')].map(o =>
 const actions = [...post.querySelectorAll('[aria-label]')].map(e => e.getAttribute('aria-label'))
   .find(a => /^Actions for this post/.test(a));
 const is_post = !!link || !!actions;
+// normal posts: message block; text-on-background posts: story_message, which repeats the text in an aria-hidden copy
+const story = () => {
+  const el = q('[data-ad-rendering-role="story_message"]');
+  if (!el) return null;
+  const c = el.cloneNode(true);
+  c.querySelectorAll('[aria-hidden="true"]').forEach(n => n.remove());
+  return c.textContent.trim() || null;
+};
 return {
   author: actions ? actions.replace(/^Actions for this post by /, '') : txt(q('h2, h3, h4')),
-  text: txt(q('[data-ad-preview="message"], [data-ad-comet-preview="message"]')),
+  text: txt(q('[data-ad-preview="message"], [data-ad-comet-preview="message"]')) || story(),
   url: link,
   reactions_total: total ? total[1].trim() : null,  // FB hides the total when there's one reaction type
   is_post,
@@ -70,6 +80,10 @@ return {
 
 
 def make_driver(headless):
+    # A run that was killed leaves Singleton* lock links naming its host; in a fresh container (new hostname)
+    # Chrome then thinks another machine owns the profile and exits. ponytail: assumes one run at a time.
+    for f in PROFILE.glob("Singleton*"):
+        f.unlink(missing_ok=True)
     opts = webdriver.ChromeOptions()
     if os.environ.get("CHROME_BIN"):
         opts.binary_location = os.environ["CHROME_BIN"]  # e.g. Chromium in Docker
@@ -190,6 +204,101 @@ setTimeout(step, 1500);
 """
 
 
+# The time link: points at the post, or at the group root until hovered. Its text is scrambled on purpose.
+TIME_LINK_JS = r"""
+const as = [...arguments[0].querySelectorAll('a[role="link"]')];
+return as.find(a => /\/(posts|permalink)\//.test(a.href))
+  || as.find(a => /\/groups\/[^/]+\/?$/.test(new URL(a.href).pathname) && a.innerText.trim());
+"""
+
+
+def parse_fb_time(s):
+    """'Wednesday, October 14, 2026 at 11:50 PM' -> ISO 8601 in the browser's timezone."""
+    try:
+        t = datetime.strptime(s.replace(" ", " ").strip(), "%A, %B %d, %Y at %I:%M %p")
+        return t.astimezone().isoformat()
+    except ValueError:
+        return None
+
+
+def post_time(d, post):
+    """Hover the time link: the tooltip has the full date and the link turns into the post URL."""
+    try:
+        a = d.execute_script(TIME_LINK_JS, post)
+        if not a:
+            return None, None
+        d.execute_script("arguments[0].scrollIntoView({block: 'center'})", a)
+        ActionChains(d).move_to_element(a).perform()
+        nap(1.2, 2)
+        tips = [t.text for t in d.find_elements(By.CSS_SELECTOR, '[role="tooltip"]') if t.text.strip()]
+        ActionChains(d).move_by_offset(0, 150).perform()  # move off so the tooltip closes
+        href = (a.get_attribute("href") or "").split("?")[0]
+        return (tips[-1] if tips else None), (href if "/posts/" in href or "/permalink/" in href else None)
+    except Exception:
+        return None, None
+
+
+# Reads the reactions dialog: one tab per type, aria-label="Show 3 people who reacted with Love".
+# Types that don't fit sit under a "More" tab whose menu items use the same label.
+REACTIONS_JS = r"""
+const re = /^Show ([\d.,]+\s*[KM]?) (?:people|person) who reacted with (\w+)$/;
+const out = {};
+for (const e of document.querySelectorAll('[aria-label*="who reacted with"]')) {
+  const m = e.getAttribute('aria-label').match(re);
+  if (m) out[m[2]] = m[1];
+}
+// "More" menu rows are icon + number; take a name from any label/alt, else keep the count as other_N
+let n = 0;
+for (const it of document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]')) {
+  const count = (it.innerText.match(/[\d.,]+\s*[KM]?/) || [])[0];
+  if (!count) continue;
+  const label = [it, ...it.querySelectorAll('[aria-label], img[alt]')]
+    .map(e => e.getAttribute('aria-label') || e.getAttribute('alt') || '').join(' ');
+  const m = label.match(re) || label.match(/\b(Like|Love|Care|Haha|Wow|Sad|Angry)\b/i);
+  const name = m ? (m.length > 2 ? m[2] : m[1]) : `other_${++n}`;
+  if (!(name in out)) out[name] = count.trim();
+}
+return out;
+"""
+
+
+def reaction_counts(d, post):
+    """Open the reactions dialog from the first reaction icon, read every type's count, close it."""
+    icons = post.find_elements(By.CSS_SELECTOR, '[aria-label="See who reacted to this"] [role="button"]')
+    if not icons:
+        return None
+    try:
+        d.execute_script("arguments[0].scrollIntoView({block: 'center'})", icons[0])
+        nap(0.5, 1)
+        try:
+            icons[0].click()
+        except ElementClickInterceptedException:
+            d.execute_script("arguments[0].click()", icons[0])
+        nap(2, 3.5)
+        dialog = next((dl for dl in d.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                       if dl.find_elements(By.CSS_SELECTOR, '[aria-label*="who reacted with"]')), None)
+        if not dialog:
+            return None
+        more = [t for t in dialog.find_elements(By.CSS_SELECTOR, '[role="tab"], [role="button"], [aria-haspopup]')
+                if t.text.strip().startswith("More")]
+        if more:  # overflow types (e.g. Care, Wow, Sad) live in a dropdown menu
+            try:
+                more[0].click()
+            except ElementClickInterceptedException:
+                d.execute_script("arguments[0].click()", more[0])
+            nap(1, 2)
+        counts = d.execute_script(REACTIONS_JS)
+        close = dialog.find_elements(By.CSS_SELECTOR, '[aria-label="Close"]')
+        d.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)  # closes the More menu if open
+        if close and close[0].is_displayed():
+            close[0].click()
+        nap(1, 2)
+        return counts or None
+    except Exception as e:
+        print(f"  reactions dialog failed: {e.__class__.__name__}")
+        return None
+
+
 def poll_voters(d, post, poll):
     """Click each option's percentage arrow, read the voter dialog, close it."""
     d.set_script_timeout(120)
@@ -241,6 +350,19 @@ def scrape(url, limit, headless):
                 seen.add(key)
                 if data["reactions_total"] is None and all(v.isdigit() for v in data["reaction_types"].values()):
                     data["reactions_total"] = str(sum(map(int, data["reaction_types"].values()))) if data["reaction_types"] else "0"
+                tip, href = post_time(d, it)
+                data["posted_at"], data["posted_at_text"] = parse_fb_time(tip) if tip else None, tip
+                data["url"] = data["url"] or href
+                if data["url"]:
+                    if data["url"] in seen and data["url"] != key:
+                        continue  # same post seen earlier under its text key (link only appears after hover)
+                    seen.add(data["url"])
+                if data["reaction_types"]:
+                    full = reaction_counts(d, it)
+                    if full:
+                        data["reaction_types"] = full
+                        if all(v.isdigit() for v in full.values()):
+                            data["reactions_total"] = str(sum(map(int, full.values())))
                 if data["poll"]:
                     poll_voters(d, it, data["poll"])
                 posts.append(data)
