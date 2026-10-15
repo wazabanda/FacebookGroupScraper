@@ -1,0 +1,19 @@
+# docker compose run --rm scraper                # scrapes $GROUP_URL from .env
+# docker compose run --rm scraper <url> --posts 50
+services:
+  scraper:
+    build: .
+    image: groupscraper
+    shm_size: 1g
+    volumes:
+      - ./data:/data
+    env_file:
+      - path: .env
+        required: false
+    # take precedence over .env, whose paths are for running outside Docker
+    environment:
+      FB_PROFILE: /data/fb_profile
+      FB_COOKIES: /data/cookies.json
+      OUT: /data/posts-%Y%m%d-%H%M.json
+      HEADLESS: "1"
+    command: ["${GROUP_URL:?set GROUP_URL in .env or pass a url}", "--posts", "${POSTS:-30}"]

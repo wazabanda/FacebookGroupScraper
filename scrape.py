@@ -16,7 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
 HERE = Path(__file__).parent
-PROFILE = HERE / "fb_profile"
+PROFILE = Path(os.environ.get("FB_PROFILE") or HERE / "fb_profile")
 
 
 def load_env(path=HERE / ".env"):
@@ -71,12 +71,45 @@ return {
 
 def make_driver(headless):
     opts = webdriver.ChromeOptions()
+    if os.environ.get("CHROME_BIN"):
+        opts.binary_location = os.environ["CHROME_BIN"]  # e.g. Chromium in Docker
     opts.add_argument(f"--user-data-dir={PROFILE.resolve()}")
     opts.add_argument("--disable-notifications")
     opts.add_argument("--lang=en-US")
+    opts.add_argument("--disable-dev-shm-usage")  # Docker's /dev/shm is too small for Chrome
+    if os.geteuid() == 0:
+        opts.add_argument("--no-sandbox")  # Chrome refuses to start as root otherwise
     if headless:
         opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1366,900")
     return webdriver.Chrome(options=opts)
+
+
+def cookie_file():
+    return Path(os.environ.get("FB_COOKIES") or HERE / "cookies.json")
+
+
+def save_cookies(d):
+    if (p := cookie_file()) and logged_in(d):
+        p.write_text(json.dumps(d.get_cookies(), indent=1))
+        p.chmod(0o600)
+
+
+def load_cookies(d):
+    """Log in from a cookies file exported on another machine (see README: Running on a server)."""
+    p = cookie_file()
+    if not (p and p.exists()):
+        return
+    for c in json.loads(p.read_text()):
+        if c.get("sameSite") not in ("Strict", "Lax", "None"):
+            c.pop("sameSite", None)
+        try:
+            d.add_cookie(c)
+        except Exception:
+            pass
+    d.refresh()
+    nap(2, 4)
+    print("logged in from cookies" if logged_in(d) else f"cookies in {p} are expired or invalid")
 
 
 def nap(a, b):
@@ -186,7 +219,10 @@ def scrape(url, limit, headless):
         d.get("https://www.facebook.com/")
         nap(2, 4)
         if not logged_in(d):
+            load_cookies(d)
+        if not logged_in(d):
             auto_login(d, headless)
+        save_cookies(d)  # keep the file fresh: FB rotates session cookies
         d.get(url)
         nap(4, 8)
         posts, seen, stale = [], set(), 0
@@ -219,16 +255,30 @@ def scrape(url, limit, headless):
             # scroll a random distance so it doesn't look scripted
             d.execute_script("window.scrollBy(0, window.innerHeight * arguments[0])", random.uniform(0.8, 2.2))
             nap(*scroll_delay)
+        save_cookies(d)
         return posts
     finally:
         d.quit()
 
 
-def login():
-    d = make_driver(headless=False)
-    d.get("https://www.facebook.com/")
-    input("Log in in the browser window, then press Enter here...")
-    d.quit()
+def login(headless):
+    """Get a session (saved profile -> .env credentials -> by hand) and export it to the cookies file."""
+    d = make_driver(headless)
+    try:
+        d.get("https://www.facebook.com/")
+        nap(2, 4)
+        if not logged_in(d) and os.environ.get("FB_EMAIL"):
+            auto_login(d, headless)
+        if not logged_in(d):
+            if headless:
+                raise SystemExit("not logged in: set FB_EMAIL/FB_PASSWORD in .env or run without --headless")
+            input("Log in in the browser window, then press Enter here...")
+        if not logged_in(d):
+            raise SystemExit("still not logged in")
+        save_cookies(d)
+        print(f"session cookies saved to {cookie_file()} - copy this file to the server")
+    finally:
+        d.quit()
 
 
 if __name__ == "__main__":
@@ -236,15 +286,18 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("url", nargs="?")
     ap.add_argument("--posts", type=int, default=20)
-    ap.add_argument("--out", default="posts.json")
-    ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--login", action="store_true")
+    ap.add_argument("--out", default=os.environ.get("OUT", "posts.json"),
+                    help="output file; strftime codes allowed, e.g. posts-%%Y%%m%%d-%%H%%M.json")
+    ap.add_argument("--headless", action="store_true", default=os.environ.get("HEADLESS") == "1")
+    ap.add_argument("--login", action="store_true", help="log in and export session cookies (for a server), then exit")
     a = ap.parse_args()
     if a.login:
-        login()
+        login(a.headless)
     elif a.url:
+        out = Path(time.strftime(a.out))
+        out.parent.mkdir(parents=True, exist_ok=True)
         res = scrape(a.url, a.posts, a.headless)
-        Path(a.out).write_text(json.dumps(res, indent=2, ensure_ascii=False))
-        print(f"saved {len(res)} posts -> {a.out}")
+        out.write_text(json.dumps(res, indent=2, ensure_ascii=False))
+        print(f"saved {len(res)} posts -> {out}")
     else:
         ap.error("give a group url or --login")

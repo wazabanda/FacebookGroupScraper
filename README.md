@@ -29,6 +29,9 @@ chmod 600 .env
 | `SCROLL_DELAY` | `3,7` | Random wait in seconds between scrolls (`min,max`) |
 | `BATCH_SIZE` | `10` | Take a longer break after this many posts |
 | `BATCH_PAUSE` | `20,45` | Length of that break in seconds (`min,max`) |
+| `FB_COOKIES` | `cookies.json` | Session cookies file. Exported by `--login`, used to log in on a server. |
+| `HEADLESS` | `0` | `1` = always run without a window |
+| `OUT` | `posts.json` | Output file. `strftime` codes allowed, e.g. `data/posts-%Y%m%d-%H%M.json` |
 
 ## Usage
 
@@ -41,17 +44,79 @@ uv run scrape.py https://www.facebook.com/groups/1421088291504611/ --posts 50
 | Option | Default | Description |
 |---|---|---|
 | `--posts N` | 20 | Number of posts to collect |
-| `--out FILE` | `posts.json` | Output file |
-| `--headless` | off | Run Chrome without a window |
-| `--login` | | Open Chrome to log in by hand and save the session |
+| `--out FILE` | `OUT` | Output file (`strftime` codes allowed) |
+| `--headless` | `HEADLESS` | Run Chrome without a window |
+| `--login` | | Log in and export session cookies to `FB_COOKIES`, then exit |
 
 ### Logging in
 
-If there's no saved session, the script logs in with `FB_EMAIL`/`FB_PASSWORD`, and the session is saved to `./fb_profile`. Later runs reuse that session and don't log in again.
+If there's no saved session, the script tries the `FB_COOKIES` file, then `FB_EMAIL`/`FB_PASSWORD`. The session is saved to `./fb_profile`. Later runs reuse that session and don't log in again.
 
 If Facebook asks for 2FA or "Is this you?" verification, the first run must have a visible window (no `--headless`) so you can complete it. After that, headless and scheduled runs work. You can also run `uv run scrape.py --login` to log in entirely by hand.
 
 Without credentials, public groups show only a few posts before Facebook's login wall stops the feed.
+
+## Running on a server
+
+Don't log in from the server. Facebook challenges password logins from data-center IPs, and a headless run can't answer the challenge. Log in on your own computer and copy the session cookies to the server instead.
+
+1. **On your computer**, export the cookies:
+   ```bash
+   uv run scrape.py --login --headless
+   ```
+   This reuses your saved session, or logs in with `FB_EMAIL`/`FB_PASSWORD`, then writes `cookies.json` and exits. If Facebook asks for verification, run it without `--headless` and complete the check in the window.
+2. **Copy it to the server:**
+   ```bash
+   scp cookies.json server:GroupScraper/
+   ```
+3. **On the server** (Google Chrome and uv installed, `uv sync` done), `.env` needs only:
+   ```
+   FB_COOKIES=cookies.json
+   HEADLESS=1
+   ```
+   Leave `FB_EMAIL`/`FB_PASSWORD` out so a failed session never turns into a password login from the server.
+4. **Schedule a few runs a day** with cron:
+   ```
+   0 8,14,20 * * * cd ~/GroupScraper && ~/.local/bin/uv run scrape.py <group_url> --posts 30 --out posts-$(date +\%F-\%H).json >> scrape.log 2>&1
+   ```
+
+Every run writes the refreshed cookies back to the file, so the session usually lasts months. When the log says `cookies ... are expired or invalid`, repeat steps 1–2.
+
+The script adds the Chrome options needed in Docker or as root (`--no-sandbox`, `--disable-dev-shm-usage`) automatically.
+
+## Docker
+
+The image bundles Chromium and runs headless. The session, cookies and output go in a `/data` volume.
+
+```bash
+docker build -t groupscraper .
+mkdir -p data && cp cookies.json data/      # cookies exported with `--login` on your computer
+
+docker run --rm --shm-size=1g -v "$PWD/data:/data" groupscraper \
+  https://www.facebook.com/groups/1114412480981108 --posts 30
+```
+
+Results land in `./data/posts-YYYYMMDD-HHMM.json`, one file per run. Override with `--out /data/<name>.json`, or set `OUT` in `.env`.
+
+### Docker Compose
+
+Set `GROUP_URL` (and optionally `POSTS`) in `.env`, then:
+
+```bash
+docker compose build
+docker compose run --rm scraper                                   # scrapes GROUP_URL
+docker compose run --rm scraper <group_url> --posts 50            # or any group
+```
+
+Compose reads `.env` for credentials and delays, mounts `./data`, and makes sure the Docker paths (`/data/...`) win over any `FB_COOKIES`/`OUT` set in `.env`. For cron: `cd ~/GroupScraper && docker compose run --rm scraper >> scrape.log 2>&1`.
+
+Don't run `docker compose config` without `--no-interpolate`: it prints `.env` values, including your password.
+
+### Notes
+
+- With plain `docker run`, an `--env-file .env` that sets `FB_COOKIES`, `FB_PROFILE` or `OUT` overrides the `/data` paths, so remove those from it. Compose handles this for you. Add `--env-file .env` to pass delays or `FB_EMAIL`/`FB_PASSWORD` as a fallback login.
+- `data/fb_profile/` keeps the browser session between runs, so don't delete `data/`.
+- For cron, put the `docker run ...` line in the schedule from the section above.
 
 ## Output
 
@@ -83,6 +148,6 @@ Without credentials, public groups show only a few posts before Facebook's login
 
 - Facebook changes its page markup often. When a field starts returning `null`, the selectors in `EXTRACT_JS` in `scrape.py` need updating.
 - Scraping is against Facebook's Terms of Service. Use a secondary account, keep runs small, and don't run several at once. Accounts can be checkpointed or banned.
-- `.env` holds your password in plain text and `fb_profile/` holds your session cookies. Don't commit or share either (both are in `.gitignore`).
+- `.env` holds your password in plain text, and `fb_profile/` and `cookies.json` give full access to the account. Don't commit or share any of them (all are in `.gitignore`).
 - Fresh logins are the riskiest part for bans. Let the saved session do the work instead of deleting `fb_profile/`.
 - Collecting members' data from a group may fall under GDPR or local privacy law.
